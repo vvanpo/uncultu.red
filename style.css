@@ -2,3 +2,7 @@
 p {
   max-width: 66ch;
 }
+
+code {
+  color: #444;
+}
