@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+
+<title>July 9, 2014 | uncultu.red</title>
+<link href="/style.css" rel="stylesheet">
+<meta name="viewport" content="width=device-width">
+
+<style>
+blockquote ol {
+  padding-left: 1em;
+}
+
+li {
+  margin-top: 0.25em;
+  max-width: 66ch;
+}
+
+ol > strong {
+  margin-left: -1em;
+}
+
+body > ol {
+  padding-left: 2ch;
+}
+
+body > ol p {
+  max-width: 64ch;
+}
+
+.alpha-list {
+  list-style-type: lower-alpha;
+}
+
+.roman-list {
+  list-style-type: lower-roman;
+}
+</style>
+
+<p>
+  I don't know how much you know, so I'm going to give you a dumbed-down tutorial first just in case I take something for granted.  Better to leave you bored than confused.  Ask questions if I didn't do my job correctly.
+
+<h2>Processes</h2>
+
+<p>
+  A process can be defined in a few ways.  First, you might call it an instance of a program binary.  The binary file is the data representing instructions and initialized variables, that gets loaded into memory when the program loader (a kernel routine) executes a new process.  In systems with memory protection (i.e. any that we work with) the process will see an empty address space.  For a 64-bit machine (i.e a machine which uses 64-bit-wide values to address values in memory), the process thinks it is the only inhabitant of a large, 2^64 byte array.  The program binary is generally formatted in some special way (for Linux and some others this is ELF---executable and linkable format) to signify at what address the first instruction of the program gets loaded into memory.  It is important that this is exact because all address references (and there are a lot of them in your typical program:  every control flow statement, function call, every pointer dereference) are resolved at link-time (the stage after compilation to object code) to absolute addresses hinging on being placed correctly within the address space.  So a process can be called an instance of a binary because it is essentially just that binary being loaded into an address space at a specific offset.
+
+<p>
+  Second, you could more simply define a process as being any entity with its own address space.  Remember that for protection reasons, a process sees memory as a big 2^64-byte empty array.  If it didn't, and it could see another process loaded into the same space (there's plenty of room, 2^64 is far more memory than any machine on earth has), then it could sabotage that other process.  To implement this protection, many systems (and that includes x86, ARM, PowerPC, etc.) implement paged virtual memory.  Virtual memory means the kernel can set up a virtual address space for each process, and paged means that this virtual address space is implemented by breaking up the address range into chunks (pages) of fixed size, and mapping these pages to physical memory.  In this way, the kernel might map page 32 from physical memory to page 1 of a process's virtual address space, and process 1 would still happily think that it had 2^64 addresses to play with.  Of course, if it ever tried to read from or write to an address outside of page 1, we would have a problem, and that problem is aptly called a "page fault".  Page faults are caught by the hardware, who interrupts the process and hands control over to the kernel to fix up the mess.  The kernel might choose to find an unused page in physical memory, map it to the page the process tried to access, and hand control back to the process who then goes along like nothing has happened.
+
+<p>
+  On a hardware level, paging is implemented by having an MMU (memory management unit) automatically translate virtual addresses to physical ones before sending off a request to physical memory.  The MMU knows how to read the mapping between virtual and physical addresses set up by the kernel because the architecture has a predefined specification for setting up these mappings, called "page tables".  It is the kernel's job to adhere to this specification or otherwise the hardware won't be able to "walk the page table" and look up mappings for a particular process's pages.
+
+<h2>Page-cache</h2>
+
+<p>
+  The page-cache is a memory cache for file content.  We all know that input/output is slow, so it makes sense to cache anything we might want to read or write to.  Any I/O (with the exception of "direct" I/O, a special system call option) happens to the page-cache first, and might not reach the disk until seconds later (some systems choose to simply sync the page-cache every 30 seconds and that's it).  Any file read or written to gets saved in the page-cache until there is no memory left, at which point the least recently used page gets thrown out to make room.  If you don't shut off your computer very often, and have enough memory, this could mean that your browsing history from last week is still sitting in memory.
+
+<h2>Memory mapping</h2>
+
+<p>
+  POSIX systems have a special system call, called mmap(), where a file can be directly mapped into your process's address space.  Since any file being acted on is sitting in the page cache, this means the kernel simply maps the relevant pages in the page-cache directly into the process's address space.  If any other process does the same with the same file, then pages from both virtual address spaces map to the exact same physical pages---protection for this specific range of pages is gone.  If both processes are aware of this, an advantage is that they can now easily communicate.
+
+<p>
+  Another advantage of mmap() is that there is less overhead for IO.  Normally, a process reads from a file by calling the read() system call, and writes to it by calling the write() system call.  But with mmap, the process makes the mmap() call once to set it up, and then it can perform unlimited IO on the file without ever having to make a system call (which costs thousands of cycles).  Further, making system calls means making copies from/to the page-cache using your own private memory (heap or stack)---every string read or written needs to be copied---wasting time and space.
+
+<hr>
+
+<p>
+  I'm sure all of this sounds great, but have a problem with pages and mmap.  That problem is that mmap kind of ruins some of the abstraction that a virtual address space provides.  When you mmap a file, you must do so on page boundaries.  Normally, a process never has to worry about page boundaries, because page faults are completely transparent to it.  But mapping in a file means mapping in full pages.  If you map in a 2 kB file, and your system's page size is 4 kB, then you need to know where to ask the kernel to begin the map, and you also need to know not to write any data for exactly 2 kB after the file ends.  mmap() sort of solves the first issue by giving processes the option to just have the kernel choose a location to map it to.  Or, if you do ask it to map to a specific address, it will pick the closest page boundary for you if you get it wrong.  But I'm not too happy with those solutions.
+
+<p>
+My operating system (<a href="https://github.com/vvanpo/system/blob/master/os.txt">https://github.com/vvanpo/system/blob/master/os.txt</a>) will try to keep everything very simply and minimal, using very general abstractions.  I'd rather not have a million different ways to do IO, I'd like to just have one.  Mapping seems like a rather natural way of editing files, other than some difficulties with easily specifying file boundaries (a system call would need to be involved any time file size were to be changed, and what happens if you are already using memory directly past the boundary?  You'd need to remap the file.), and the aforementioned page boundary issue.  Also, if you deal with a lot of files that are smaller than a page, you end up with a lot of mostly-empty pages in your cache.  if you just didn't allow mapping at all, you could always implement some method of reducing fragmentation by grouping small files together onto one page.
+
+<p>
+  So the other option for IO would be to stick to simple read &amp; write system calls, but that means a call every time you want to do a simple read and write.  If you had a file full of text, and you wanted to find a particular sentence and swap out the word "cat" for "lol", you'd likely do a syscall to read the whole file into memory (which, unlike mmap, causes a full copy of the file to be made in memory), search through the resulting array for the sentence, and then do a write syscall to change the word.  For every new word you want to change, you'd again need to do another write syscall.  For mmap, you only need 1 syscall, and it doesn't require any copying and doesn't use twice the memory.
+
+<p>
+  My high-level draft specification linked above is constantly changing, but my idea for a page-cache isn't to have a single list of uncompressed pages: I might try to implement some transparent compression for pages that could make the IO path to disk quite a bit simpler, and also perhaps use some anti-fragmentation tricks by combining pages.  This might make it difficult to use mmap, unless I were to make separate, fragmented copies of pages (as needed) to be used for mapping.  This would eliminate some of the current advantage mmap offers by not needing copies.  Hence why I'm leaning towards separate read &amp; write syscalls as the method of IO for my OS.
+
+<p>
+  If you were to design an OS, and wanted to make the abstraction available to a process as simple as possible, how would you do it?
+
+<blockquote>
+  <ol>
+    <strong>Processes</strong>
+    <li>
+      About the process seeing like 18 exabytes worth of memory: why? What's the point? I'm assuming this memory is the stack and heap? How does the whatever relevant piece of... machinery (which?) decide how much actual space to allocate to this specific process? Or is physical memory given out on a first come first serve basis? What happens when a process writes to some virtual memory and then turns out the physical memory is full? The process terminates? With what?
+    <li>
+      If you've got two instances of a program binary, does the program loader load the binary into memory twice, at two different locations?
+    <li>
+      How big is a page?
+    </li>
+    <br>
+    <strong>Page-cache</strong>
+    <li>
+      You're referring here to disk I/O? Okay yeah you are.
+    </li>
+    <br>
+    <strong>Memory mapping</strong>
+    <li>
+      So if both processes are aware of this, they can communicate by writing to and reading from the page-cache? And essentially there will be 3 copies of these pages in memory: 1 in each process address space, and 1 in the page cache. Oh and then one more on the hard disk.
+    <li>
+      Again, are read() and write() system calls that access the hard disk? What do you mean by making system calls requires using your own private memory? You're saying data is read from the hard disk, put in the process' memory, and then copied to the page-cache? Why not directly?
+    </li>
+    <br>
+    <strong>ur problem with pages and mmap()</strong>
+    <li>
+      I'm not sure I get this. When you mmap a file, it reads the file from the disk, and writes it into the page-cache. Right? I'm assuming the page-cache is just a section in physical memory? Or is page-cache unique to each process? Or maybe the page cache doesn't actually contain the file and only the changes? I dunno halp
+  </ol>
+  <p>
+    Maybe I should wait until the earlier questions are answered. Then I can do the rest
+</blockquote>
+
+<ol>
+  <li>
+    <p>
+      Basically, a process can do one of two things with memory.  Load, or store (i.e. read or write).  A load instruction takes an address to load a value from, and a store instruction does the same.  If the registers on your chip are 64 bits wide, then you could potentially ask for address 0xffffffffffffffff, or you could ask for address 0x0.  So in that sense it "sees" 18 EiB.  When we only had 32-bit chips, that maximum was 0x0 to 0xffffffff, or 4 GiB.  That meant any system could only access as much as 4 GiB, which was a problem (there were some tricks to overcome this, courtesy of Intel).  32-bit is also a bit annoying in that integers overflow often for some things, and operating on only 4 bytes per clock cycle is obviously slower than operating on 8 bytes per clock cycle.
+    <p>
+      Just seeing 18 EiB does not mean even 1 byte of that is actually in use by the physical memory.  Modern systems use what is called "demand paging".  When a process executes a load or store instruction on a page it does not have resident in memory, a page fault occurs, and the kernel finds a free page to map to it.  The process doesn't know any of this happened, it just gets "frozen" for a short time while the kernel is busy doing this.  Like in X-men.  Professor Xavier is clearly an OS kernel.
+    <p>
+      If the system is out of physical memory, then you are shit out of luck unless you have a swap file.  A swap file is an "extension" of physical memory that the OS uses to temporarily store pages in that haven't been used recently.  If you are actively using more memory than you have, though, you'll start "trashing" the disk: constantly causing page faults that require the kernel to wait for a page to be retrieved from swap.  This kills performance of your system, most people know it as "halp ma comptor is frozen".  If you run out of space on both your physical memory and swap file, then the kernel has no choice but to kill a process to free up memory.  It can also just deny processes from allocating new memory.  How it chooses a process to kill is usually up to some algorithm on who is being the greediest with memory use.
+  <li>
+    <p>
+      Yes.  But more than likely the majority of the code is in shared object files---libraries---and these get mmap()ed into each address space from the page-cache, meaning the memory gets shared.  Try the following:  "cat /proc/self/maps".  That is a list of all mmap()ed files into the current process, which would be the current bash instance.  libc, for example, is going to be mapped into just about every program (libc contains all the standard C functions, like printf, malloc, etc.).
+  <li>
+    <p>
+      Depends on the architecture.  x86 has a few options, depending on the particular chip you buy, but it is almost always 4 kiB.  PowerPC has more options, I believe.  Most PowerPC chips running linux are made by IBM (like the ones I use at work), and they suck at TLB misses, so they compile linux to have a larger page size: 64 kiB (larger pages means you can fit a larger range of memory in the TLB).  That mmap() problem about most small files causing lots of mostly-empty pages in the cache?  Yep, I see that at work every day.  Most linux programs use mmap quite a bit, so as a result most processes use up twice as much memory on an IBM Power machine as on an Intel x86 machine.  Yay.
+  <li>
+    <p>
+      Generally, yes.  I/O can mean disk or network or USB or whatever.  Any peripheral resource.  So as far as files go, they could potentially be served over the network (i.e. NFS), in which case the same thing applies and they still get stored in the page-cache.
+  <li>
+    <p>
+    The whole idea behind mapping is that there is only <em>one</em> copy in physical memory.  The kernel just maps it to a specific page in the virtual address spaces of whatever processes.  There is of course a copy on the disk (although not for temporary files), but that is unavoidable as there are no instructions available for accessing a disk directly; everything must go through memory.
+  <li>
+    <p>
+      No, read() and write() access file descriptors, and the file (or part of the file) is stored in memory, in the page-cache.
+    <p>
+      Let's use an example.  Let's say you want to read from a file that has not been accessed yet, i.e. is not in the page-cache.  You open the file with the open() system call, which gives you a file descriptor for that file.  Then, you use the read() system call to read the first 5 kiB into some variable in your program.  Now, a system call is just a call to the kernel, so at this point the kernel takes over.  It sees that the relevant pages are not in memory, so it calls the filesystem driver to grab the relevant file, which in turn calls the SATA driver to grab the right sequences of bytes from the disk.  You asked for the first 5 kiB, which if we are assuming 4 kiB pages, means 2 pages.  So after the drivers do their work 2 pages get stored in the page-cache.
+    <p>
+      Now the kernel makes a copy of those first 5 kiB, and writes it into the address you provided it in your system call (the address of the variable you want it stored in).  The point is that it doesn't just map the pages from the page-cache into the process, it actually makes a copy of the data.  Memory use since the call first increased 8 kiB to load those 2 pages, and now you are using up an additional 5 kiB in you private memory for the copy of the data.
+    <p>
+      You just got the order wrong:  to go to or from a file things always go through the page-cache first.  To write to a file goes process->page-cache>disk.  To read from a file goes disk->page-cache->process.
+  <li>
+    <p>
+      Because of demand paging, it actually only reads a page from a file when it is specifically accessed.  You can load a 10 GB file and read from it one page at a time and it will only load one page at a time.  But that is a detail.  The page-cache is a section of kernel memory (which apparently is also virtual, but I don't understand why yet and I always kinda assumed it wasn't), and is not visible to processes.  Remember, a process can only see it's own address space, nothing else.  The page-cache is a global file cache for the system, used by any process that uses mmap().  So no, it is not unique to each process.  The page cache contains sections of each file (broken up into pages), but it is very possible (and likely) that it contains all the pages needed to make up the whole file.
+</ol>
+
+<blockquote>
+  <ol class="alpha-list">
+    <li>
+      You said a page fault occurs whenever a load or store occurs on page not in "resident memory". What does this mean? Translate it to C pls. I mean if I try to address something I haven't malloced, of course I'll get a page fault. If I try to access a value outside my array, same thing. What is the situation where a page fault occurs but this page fault is hidden from me and it doesn't crash my program?
+    <li>
+      Okay and I think I mostly get the page-cache thing. So if I understand it, a program wants to access some amount of some file. This amount of this file is loaded into the page cache by the kernel, owned by the kernel. Then let's say the program had wanted it as data to do some stuff with. Then whatever amount asked for is loaded into the program memory. Let's say the program had wanted it as code to run. Then the code is mmap'd "into" the expected virtual memory address.
+    <li>
+      So now I'm reading your initial problem and I've got another question. You mention the kernel gives a process the option of where to mmap the file to, or to have the kernel pick a spot. I'm assuming malloc delegates this to the kernel. I'm assuming you overwriting some data to the heap is the equivalent of the process choosing? Let's say a page in virtual memory points to some shit in the page-cache because it was mmap'd there. So the MMU knows that every address in this range of the program's virtual memory points to this shit in the page-cache?
+    <li>
+      I guess I'm also hung up on the fact that there are two things of memory for every process. I mean there's the actual code that is being run by the cpu. This is typically in the page cache then? And mmap'd to... what. Then there is this processes memory. So that's like two things for each process sort of.
+    <li>
+      If I get this the current IO for a process to manipulate the filesystem is read, write, and mmap, and the whole thing is restricted to page sizes? And you think this abstraction is too complex.
+  </ol>
+</blockquote>
+
+<ol class="alpha-list">
+  <li>
+    <p>
+      Malloc is a userspace function, it's part of libc and is therefore mmap()ed into your program at load-time.  What malloc does is some basic book-keeping on blocks of memory in the heap.  It uses the sbrk() system call to ask for memory when it runs out.  What it means to ask for memory... well I'm actually not sure, that's up to the operating system to define.  In UNIX I guess it is suppose to mean that the kernel automatically maps fresh pages into your address space, so that no page faults will occur.  Otherwise, if you wanted to allocate like 1 GB, and you sequentially touched that memory, 4 kiB pages would cause like ~250 million page faults in a row.  That would be realllllly slow.
+    <p>
+      If you were designing an OS and wanted to give a big middle finger to POSIX, like me, I don't see why you couldn't just forego sbrk() and malloc() altogether.  You'd still want something for book-keeping, but as far as "allocating memory" is concerned, that could happen automatically.
+    <p>
+      In UNIX, dereferencing pointers outside a malloc()ed or mmap()ed region causes a page fault, and when the kernel sees that you haven't asked for that address, it sends a crippling signal to your process: SIGSEGV, i.e. segmentation fault.
+    <p>
+      Take the stuff above with a grain of salt.  I've never actually used this stuff myself, this is pretty low-level and you basically never have to use it manually unless you're doing something weird.
+  <li>
+    <p>
+      I prefer the term "mapped" rather than "loaded", since "loading" in my mind means making a copy.  Mapping pages from physical to virtual memory is as simple as putting a few entries in the page table.
+  <li>
+    <p>
+      malloc() isn't generally making any mmap() calls.  Remember the stack/heap thing?  Stack grows down, heap grows up?  And all that space in the middle?  Well on a 64-bit machine as you pointed out that space in the middle is like 18 EiB, so you have a lot of room.  Malloc makes the heap grow up a bit every now and then, and function calls make the stack grow down a bit, but in the vast emptiness between them you can mmap() large swathes of memory to your content.  And you do that by calling mmap() directly, not malloc().
+    <p>
+      If you were to try and mmap() junk into the heap, well you'd kinda fuck things up, I think.  malloc() and free() do their bookkeeping in the heap, and their implementation varies.  So if you mmap() in a page to the heap, it won't overwrite a page in the heap, it'll simply replace the page table entry with the mmap()ed one, meaning you can no longer access the data that was once written on that page in the heap.  It'll still be in physical memory, mind you, it just won't be visible by your program anymore.  Likely the kernel will just flag it as empty and use it to map into any process that is asking for more memory.
+    <p>
+      When I said you can let the process choose where to mmap() shit, I meant that one of the parameters to mmap() is literally an address.  So you can tell the kernel to mmap() some file to address 0x1f00, for example.  That doesn't fall on a page boundary, so the kernel might adjust it and return 0x2000 to tell you that that is the address where the mmap()ed file actually starts.
+    <p>
+      And yep, the MMU knows because each page in the process has its own entry in the page table.
+  <li>
+    <p>
+      That would be a Harvard Architecture.  That's not the kind of computers we use.  We use a Von Neumann architecture, where code and data are the same thing.  You get one address space, do with it what you want.  Point your instruction pointer at some data for all I care.  It will of course cause an exception, since very likely the data isn't also sensible code, but you could do it if you want.  If your OS/architecture doesn't automatically mark code pages as read-only, you could also edit your own code as you are running.  Generally, code lies at the bottom-most addresses, but really there is nothing stopping you from writing some code into address 0x2994358df09e and point the instruction pointer there.
+  <li>
+    <p>
+      Kinda.  There are actually a lot more system calls than that, especially in linux, and tons of options and flags for each, but that is the gist.  read() and write() are not restricted to page sizes, you can pass in a string of any length to read(), or ask for a string of any length from write().  But mmap() is inherently bound to page sizes.  So writing portable code with read()/write() is trivial, but with mmap() may sometimes require some thought().
+</ol>
+
+<blockquote>
+  <ol class="alpha-list">
+    <li value="2">
+      "mapping pages from physical into virtual memory is as simple as putting a few entries in the page table". But each process has their own 18EiB of virtual memory right? So this "page table" is local to each process? Are we still talking about the MMU here? How does it have a separate table for each process?
+    <li>
+      I guess I'm confused about when mmap() is actually called. What can I write in C that would invoke mmap()?
+    <li>
+      I'm still confused though. How does this work. Let's say I have binary file somewhere that is the compiled version of some C program that reads a file on the disk in.txt, obtains a number from this file and declares an int with this value, and then writes this int to a file out.txt on the disk. What happens when I ask to run this program? Fill in my blanks for me:
+      <ol>
+        <li>
+          ???
+        <li>
+          binary loaded into page-cache? or mb not
+        <li>
+          ???
+        <li>
+          kernel starts executing instructions from.... some address space?
+        <li>
+          kernel loads in.txt contents into page-cache
+        <li>
+          kernel mmaps in.txt into virtual memory for dis program?
+        <li>
+          still not sure what happen???
+        <li>
+          ???
+        <li>
+          virtual address gets an int value
+        <li>
+          physical page given to dis virtual address
+        <li>
+          int stored???
+        <li>
+          ???
+        <li>
+          kernel writes out.txt to page-cache
+        <li>
+          program exits and entry mapping virtual page to physical page removed
+        <li>
+          page-cache out.txt written to disk
+      </ol>
+    <li>
+      how does this make mmap() unportable? seems like it only needs a parameter that tells it what the page size is. right? what code requires thought()?
+  </ol>
+</blockquote>
+
+<ol class="alpha-list">
+  <li value="2">
+    <p>
+      There is only one global page table.  Each entry simply has a process id, the virtual page, and the physical page that it maps to.  There is a register in each CPU that hold the process id of the currently executing process.  This way, when a load or store occurs, the MMU simply has to take the process id in the register and the virtual address passed by the instruction, and find the corresponding page-table entry which contains the physical page address.
+  <li>
+    <p>
+      Well mmap() is a libc wrapper around the system call, so you can write your own C code and call mmap() directly.  Lots of libraries use mmap().  It's useful for IO to/from a file, it's useful for shared memory and communication/synchronization, etc.
+  <li>
+    <ol>
+      <li>
+        If the binary file is not already in the page-cache, then the kernel calls upon the filesystem driver to find the file.
+      <li>
+         The filesystem driver looks up the inode for the filename and the correspond block numbers on the disk, and calls the disk driver to read in the corresponding blocks.
+      <li>
+         The filesystem driver copies these blocks into the page cache.  The kernel now has a mapping of filename -> sequence (not necessarily contiguous) of pages.
+      <li>
+        The kernel loader "creates" a new address space by coming up with an as-yet unused process id.
+      <li>
+        The loader reads the ELF header of the file it has open, and using the configuration information herein mmap()s or read()s the code, initialized data, etc. into the new address space.
+      <li>
+        The ELF file contains the address of the first instruction at a specified location, so that the loader knows how to find it.  Using this, the loader sets up the stack and passes control to the new process by placing this first instruction address into the instruction pointer register, also called the program counter.
+      <li>
+        The newly created process starts running and requests that in.txt be "opened" using the open() system call.  The kernel passes this on to the filesystem driver, who returns some basic information about the file to the kernel:  the inode number, etc.  The kernel returns a "file descriptor" to the process, which is really just a number that identifies the file and lets the kernel keep track of what processes are allowed to read/write to what files.
+      <li>
+         The process then asks to read from in.txt.  Let's just use read(), for simplicity.  The kernel again asks the filesystem driver to satisfy this request, who, using the inode, looks up the relevant disk blocks and calls the disk driver to fetch them.  These blocks are assembled into pages and loaded into the page-cache, just as before.
+      <li>
+        The kernel grabs the requests string from the pages in the page-cache and copies them into the process' heap/stack/wherever it asked for the string to be read to.  It also null-terminates the string.
+      <li>
+        Now the process has to open the new file it wants to write to: out.txt.  It calls open() for this again, which creates the file and returns a file descriptor.
+      <li>
+        The process uses write() with the string it got from read() as an argument on this new file descriptor.
+      <li>
+        The kernel takes the write() call, which consists of some arguments like the start address of the string, and copies the string into some new pages in the page cache.  The filesystem driver then writes these pages to disk.
+      <li>
+        The process uses the close() call to destroy the file descriptors, and exits with the exit() call.
+      <li>
+        Upon exit(), the kernel takes and page table entries using the process id of the now-finished process, and removes them from the page table.  The virtual address space has thus been destroyed.
+    </ol>
+    Let's say steps 8 had instead used mmap(), not read():  the result of loading in.txt into the page-cache would be exactly the same, but instead of copying a portion of the pages into the heap or stack of the process, the entire pages just get mapped into the process (not in the heap or stack) by creating new page table entries with the process' id.  Page table entries can't have duplicate indices, so the virtual pages must not have had existing mappings.  All (process_id, virtual_page_number) combinations in the page table must be unique.  However, multiple virtual pages can map to the same physical page.
+  <li>
+    <p>
+      I suppose it's not too horrible portability-wise, but it does mean you need some logic that is aware of page sizes.  And yes page size is a preprocessor constant you can compile into any C program, but just that fact that you even after be aware of it is something I take issue with.  It ruins the abstraction of just having a big flat address space with which you can do what you want---now you have more rules to follow because you have to pay attention to page boundaries.  I want to eliminate rules like those.
+    <p>
+      It may not seem like a big deal, but I want things to be as simple as possible for the programmer.  So I've decided I might use a segmentation scheme to take care of those kinds of details.
+</ol>
+
+<blockquote>
+  <p>
+    Okay this was way more enlightening than anything we've talked about so far. Yes or no (or question):
+  <ol class="roman-list">
+    <li>
+      The code of the binary is mmap() or read() into the newly created virtual address space. The loader next sets up the stack. In the same virtual address space.
+    <li>
+      I mean I guess this is an implementation dependent question and is probably sort of dumb. But if I imagine the virtual address space as a huge line, stack growing from the front and heap from the back, where is the code of the binary? In the middle? Before the stack? If in the middle, isn't it possible this interferes with the growth of the stack or whatever? Or is this a dumb question because the implementation of whatever can obviously see that certain pages are in use (there's code in der) and so "skips" over them.
+    <li>
+      Does the filesystem driver operate independently of the kernel? Can the kernel do other stuff while the filesystem driver is retrieving shit or writing shit?
+  </ol>
+  <p>
+    Onto your thing, why you began this whole email exchange with me.
+  <ol>
+    <li>
+      What sort of segmentation scheme are you thinking of using?
+    <li>
+      Is the distinction of physical memory and virtual memory really necessary?
+  </ol>
+</blockquote>
+
+<ol class="roman-list">
+  <li>
+    <p>
+      No, mmap() and read() are userspace functions that trap into the kernel.  The loader is a kernel space routine, so userspace functions don't make sense inside it.  In fact, the kernel can't even use libc; so no malloc, printf, etc.
+    <p>
+      Since the kernel has direct access to physical pages, and the page table is stored within a handful of these physical pages (which are never mapped to processes, or there would be a very large security concern), it just edits the page table to add mappings from the new address space to the physical pages in the page-cache that make up the binary file.  This is exactly what mmap() would do if called from userspace, but as mentioned mmap() is never called because we are already in kernel-space.
+  <li>
+    <p>
+      You're right it is implementation dependent, and you're also right to think of virtual address spaces as big number lines, starting at 0.  In x86, the stack grows down, meaning it starts at some high address and ends at some lower address.  I always envision the number line as being vertical for this reason, with 0 at the bottom and the highest address at the top.
+    <p>
+      The heap actually doesn't start at 0, it starts above the code pages.  The code pages start at 0.  Generally those pages are marked as read-only in their respective page table entries, such that an exception will occur when you try to write in there.  But that isn't strictly necessary.
+    <p>
+      If you mmap() stuff to somewhere in the middle, yes there is some risk of the stack or heap growing into it.  And remember, there is also some risk of the stack and heap growing into each other, but that would require you use 18 EiB for one process...probably ain't gonna happen.  Perfectly possible for 32-bit processes though.
+    <p>
+      I should also mention that multi-threaded processes have multiple stacks, meaning they have to find a nice way to make sure they don't run into each other as they grow.  Stack overflows occur when the stack runs into something, or reaches some arbitrary limit set out by the kernel.
+  <li>
+    <p>
+      In a monolithic kernel, like linux, the filesystem driver is part of the kernel and runs in kernel-space.  So is the disk driver, the network driver, etc.
+    <p>
+      On micro-kernels, which mine is going to be I think, generally not.  Also, linux has a special module, called FUSE, which allows you to design a filesystem driver that runs in userspace.  I use one of these to encrypt certain folders in my dropbox.
+</ol>
+<ol>
+  <li>
+    <p>
+      I'm thinking of this from the point of view of the programmer, trying to hide as much as possible from him/her.  The compiler can figure out the rest, or possibly even the loader.
+    <p>
+      I mentioned above with regards to multiple stacks and the like that you have to decide on some place to put them even though there is a chance that they may run into each other.  That's an annoying thing to have to do.  I mean how are you supposed to know how big your stack is going to grow?  Or you heap for that matter?
+    <p>
+      My idea is to leave this decision making to the compiler and just allow the programmer to define new segments as they choose.  An address within a segment would start at 0 again.  When it does actually get compiled, the compiler adds the necessary offsets.  Point is, perhaps having one big flat address space isn't even that great an abstraction when it comes to big multi-threaded programs---too much onus is put on the programmer to make organizational decisions.
+    <p>
+      So each stack would have it's own segment, you could define multiple heaps, hell, you could even use an mmap-style system call and not have to worry about page boundaries, because for you it all starts at 0 anyway.
+    <p>
+      But of course the glaring issue is that the compiler now needs to make some assumptions about how big these segments are going to get, and place them properly.  Or you could have a runtime that catches cases where an overflow is about to occur, and do some relocation on-the-fly.
+  <li>
+    <p>
+      Ooooh. Big, very big question.  Small embedded systems don't have an MMU, so virtual memory isn't possible for them.  But multitasking (i.e. having multiple processes at one time) is difficult when you have to share one big address space.  Also, you need to know how much physical memory you have... what if you only have 1 GB and you ask for an address higher than that?  And what about reserved pages?  You need to know a lot about the particular system you're going to be running on, or have a loader that dynamically changes every single address reference when it comes time to run your program.
+    <p>
+      The point is that virtual memory is an abstraction.  With it, you can just tell a programmer that he has a giant, empty array of memory to work with, always the same on any machine he will run his program on, and that he doesn't have to worry about any details.  That is very powerful.
+</ol>
+
+<blockquote>
+  <ol class="roman-list">
+    <li>
+      You said this: "5.  The loader reads the ELF header of the file it has open, and using the configuration information herein mmap()s or read()s the code, initialized data, etc. into the new address space." and then you said the kernel doesn't mmap() or read() the code because it can't use userspace functions. wat
+    <li>
+      ooh interesting. so when you have multiple threads it doesn't start a new process? yeah that makes sense because the virtual memory is shared between the threads. hmm that is interesting. how would you implement multiple stacks?
+    <li>
+      okay so I didn't really understand that. filesystem driver running in kernel-space means that nothing else happens while the filesystem driver is busy, right? i did understand the FUSE part though
+  </ol>
+  <ol>
+    <li>
+      So basically new segments would be used to prevent the need for pages? And the traditional mmap()? How exaclty?
+  </ol>
+  <p>
+    On the virtual memory being so important thing... why not leave it to standard functions of your main language? I mean when you write C how often are you aware of the actual virtual address corresponding to a pointer you're using. Does this happen in anything other than debugging? And even then it's just checking to see if it makes sense, the actual address doesn't tell you much, right? I mean in C malloc() takes care of all of that shit for you.
+  <p>
+    So when you're talking about abstracting memory to the programmer, it only really applies to assembly and other super basic languages, right?
+  <p>
+    So why couldn't you leave out virtual memory and leave that stuff to functions like malloc? Especially since you're talking about having the compiler take over some of this abstraction.
+</blockquote>
+
+<ol class="roman-list">
+  <li>
+    <p>
+      I am a tired individual.  That was a mistake.
+  <li>
+    <p>
+      Stacks are pretty simple.  Their design can vary between languages, too.  Stacks always have stack frames that represent the local data of each function call.  So main() will be the top stack frame.  In x86, you have the call and ret instructions, where call pushes the instruction pointer onto the stack, and jumps to the first instruction address of the called function, and return pops that same address off the stack and jump to it, putting you right back to where you were, at the "return" statement in your C code, for example.  You need to make sure that when you call return that the bottom-most word is the return address, though, or funky things will happen.
+    <p>
+      These two instructions, along with pop and push, use the stack pointer register to determine the bottom of the current stack.  There is also a stack frame register, but I don't think any instructions uses that one implicitly, it's just there for your convenience, and in fact some optimizations get rid of it entirely.
+    <p>
+      So to set up a stack frame in C, when you're about to call a function, you do the following:
+    <ol>
+      <li>
+        push the function arguments onto the stack, in backwards order.  Actually the first few arguments get put in registers and aren't put on the stack at all, but that's a detail.  If you didn't want to write portable code you wouldn't have to follow that convention.
+      <li>
+        push the current frame pointer register onto the stack, and then replace the register with the current stack pointer value.  What this does is create a linked list of frame pointers up to the top stack frame, so that you can always find your way back up to the main() stack frame.
+      <li>
+        use the call instruction on the address of a function.  This pushes the current instruction pointer (the one directly after call) onto the stack, and jumps to the called function.
+      <li>
+        push local variables onto the stack as needed.
+      <li>
+        If there is a return value, you'll need to place it into the correct address.  Actually, it's usually just stored in a general purpose register, but you could also use the correct frame pointer as an offset to find the right variable it needs to be stored in.
+      <li>
+        pop off all local variables and discard them, they are now out of scope
+      <li>
+        the stack pointer points at the return address again, so call "ret" and this gets popped off the stack, and you will jump back to the caller
+      <li>
+        pop the frame pointer off the stack and put it in the frame pointer register.
+      <li>
+        clean up (pop) the arguments, they're now out of scope too.
+    </ol>
+    <p>
+      To implement multiple stacks, all you have to do is put some far away address in the stack pointer, and use this procedure again to set up a new stack.  So a thread can begin with any function you like.  Then you can switch between threads at will.   However, to have the kernel aware of the different threads (in order to allow for parallel processing), you likely have to make some kind of system call.  I don't know what that one is in POSIX.
+  <li>
+    On a single-cpu system, yes.  But on a multi-core processor the filesystem driver could be doing something while a different kernel thread does something else.  Of course the kernel needs to be extremely careful with synchronization and the like.
+</ol>
+<ol>
+  <li>
+    <p>
+      It might prevent the need to know about pages.  Of course pages are stlil used behind the scenes.
+</ol>
+<p>
+  Well, security is one reason.  The kernel handles scheduling of processes, interrupt routines when programs do something they're not supposed to, and lots of other stuff.  Without have some kind of table of allowed addresses for a program any program could just overwrite the kernel and take over the job for itself.
+<p>
+  I guess it does, yeah.
