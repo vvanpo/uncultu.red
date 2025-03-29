@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+
+<title>March 29, 2025 | uncultu.red</title>
+<link href="/style.css" rel="stylesheet">
+<meta name="viewport" content="width=device-width">
+
+<p>
+Upspin turned off its key server <a href="https://web.archive.org/web/20250305213708/https://groups.google.com/g/upspin/c/Whma_O-iexM">this month</a>, after a <a href="https://github.com/upspin/upspin/graphs/contributors">long period</a> of little activity in the project. I rediscovered Upspin a few months ago after I had a spontaneous vague memory of a talk I had watched years ago from Rob Pike where he explained some system he was working on to share his home directory across multiple computers. After some digging I found <a href="https://upspin.io">upspin.io<a/>, and promptly discovered that I could not sign up with my usual email address because it had already been registered on <a href="https://web.archive.org/web/20250207121431/key.upspin.io/log">the key server</a> back in 2018. Upspin usernames are unrecoverable once you lose your private key, so I had to use a different email to register.
+
+<p>
+  Upspin is full of great ideas. It is the first distributed filesystem I’ve found with design goals that match what I personally want in a filesystem: end-to-end encryption with easy access control aimed at personal use, all via a federated protocol that trivially allows anyone to self-host. It works like this:
+  <ul>
+    <li>
+      Users register their email address, public key, and directory server location with the central Upspin key server.
+    </li>
+    <li>
+A user’s personal filesystem is rooted at their username (email address), making it part of a global namespace of user filesystems.
+    </li>
+    <li>
+To create a file, the user’s Upspin client generates a symmetric encryption key with which it encrypts the file content, and sends the ciphertext in blocks to the storage server. The storage server is a dumb component that persists blocks of data mapped to opaque reference keys, and knows nothing about the blocks or what file they might be part of. The user then sends the following to their directory server:
+    </li>
+    <ul>
+        <li>
+    The desired pathname of the file, say <code>user@example.com/foo/bar</code>
+        </li>
+        <li>
+    A signature of the pathname and ciphertext
+        </li>
+        <li>
+    The storage server location and the references it returned for each block of the ciphertext
+        </li>
+        <li>
+    The decryption key encrypted with another’s public key, once for each Upspin user that should be able to read the file
+        </li>
+    </ul>
+    <li>
+Access control is determined by a special file named “Access”, and the closest filed named as such in the path of a file controls access for it, i.e. an Access file manages access rules for an entire folder and all its subfolders, up to a subfolder that itself contains an Access file and therefore overrides it. Access files are just a map of read/list/create/write/delete permissions to usernames. When a user adds a username to the read permission they re-wrap the decryption keys of each file in the folder with that user’s key to give them access. Access files are unencrypted so that the directory server can read them and enforce permissions for file operations.
+    </li>
+    <li>
+To share a file a user just tells other users the pathname, since pathnames are absolute in the global namespace.
+    </li>
+    <li>
+When another user wants to read the <code>user@example.com/foo/bar</code> file, they first look up <code>user@example.com</code> in the central key server to get their directory server address, and make a request to this directory server for the path:
+    </li>
+    <ul>
+      <li>
+  The directory server looks up the requesting user’s public key in the key server, and can then authenticate their request because they’ve signed it.
+      </li>
+      <li>
+  The directory server finds the nearest Access file to the requested path, and determines whether they have any access right that would allow them to know of the existence of the file.
+      </li>
+      <li>
+  If they have read-rights the directory server gives back everything it has stored about the file: the signature, the location of its blocks, and the list of wrapped decryption keys.
+      </li>
+      <li>
+  The user’s client looks through the list of wrapped decryption keys to find the one it can decrypt, requests all the blocks from the referenced storage server, verifies the signature, and decrypts the blocks to read the file.
+      </li>
+    </ul>
+  </ul>
+
+<p>
+  I’ve glossed over some details and probably got a few things wrong, but this is the basics of Upspin. There’s other features like symbolic links and user groups and snapshots. The result is a global filesystem where each folder in the root is someone’s username, and anyone can query any subtree provided they’ve been granted permissions to do so. There exists a caching proxy that can be run locally, and a local filesystem implementation that can be pointed to the cache, so you end up with something that closely resembles how a Dropbox client or the like works.
+
+<p>
+The weakest link in this system is the key server; it is the only centralized piece of infrastructure, and is needed for just about every interaction. There were <a href="https://web.archive.org/web/20250329122149/https://groups.google.com/g/upspin/c/jATa7V4lg3o/m/a0qeNciqAgAJ">some ideas floated</a> around offloading this centralization to DNS, like by having an access for <code>user@example.com</code> require a lookup of example.com for an SRV record that points to a key server managing all Upspin users under that domain. That would decentralize the key server, but unless every email provider starts hosting a key server we still need a central fallback. This hasn’t yet been implemented, so currently unless you host your own key server Upspin isn’t usable anymore. And if you do host a key server, it creates a new global namespace which means you can only share with users on your key server.
+
+<p>
+I initially found it odd that email addresses were used as usernames, when Upspin has no actual relationship with email. The key server requires email verification on first registration, but provides no path to account recovery. I believe email was chosen just because it’s familiar and simple (and everyone already has one), and one-time verification provides a small barrier to registration to prevent bots from mass-registering bogus users. But considering the above problem of key server centralization, I think a better scheme would have been to make usernames a two-tuple of name + key server URL. Key servers could then choose for themselves how to accept registrations (and can use email verification if they want), and account recovery could also be a per-server choice (which of course does have <a href="https://github.com/upspin/upspin/issues/614#issuecomment-1975369324">some implications</a>).
+
+<p>
+  One thing I found irksome is that paths are the unit of sharing. This is of course inherent in the design, and Upspin actually markets itself as a “global naming system,” not per se a filesystem. But most of the time when I want to share a file my goal is to share the contents, not the details of how I’ve organized it. I structure my home folder to work best for me personally, and don’t necessarily want to leak that structure to others. I also don’t want to break my shared folders for the people I’ve shared with if I choose to reorganize and rename or move a parent folder. One thing I like about Dropbox is that I can share an individual file as a link and it mangles the path up to but not including the file name. I could reproduce this in Upspin by creating a special sharing subtree in my home folder but that requires making a copy of every file I want to share; moving the file and creating a symlink in the original location is a bit of a clunky workaround.
+
+<p>
+Speaking of renaming directories, this is an expensive operation in Upspin. A file’s absolute path is captured in the directory entry signature, so moving a subtree requires re-signing every file within. Since signing can only happen on the client, this means rewriting a lot of directory entries. If another user tries to rename part of a subtree but doesn’t have write-access to one or more subfolders the whole operation would have to fail. Thus renaming directories is actually just <a href="https://github.com/upspin/upspin/issues/539#issuecomment-345857193">not supported</a> in Upspin; the only option is to do a recursive copy and delete the original. As long as the full pathname is an intrinsic attribute of the file I don’t see a way around this.
+
+<p>
+  Upspin seems to try to be two things: your home directory accessible from anywhere, and a global naming system for sharing files. I want both of those things, but I don’t necessarily want them to be one and the same. Most of my home directory is for private use, yet I leak the entire structure to the directory server. That is metadata I don’t necessarily want exposed to hackers, cloud providers, or governments. When I do want to share something, given a choice I’d likely prefer a different name then the path it has in my home directory.
+
+<p>
+These restrictions and caveats are all quite tolerable, considering what Upspin gets you. I began implementing my <a href="https://github.com/vvanpo/upspin-fly/tree/main/dirserver">own directory server</a> recently, as the reference implementation isn’t scalable and I want something that non-technical users who can’t or don’t want to self-host can sign up for, as I think that’s what’s needed to really drive Upspin adoption. But now that the project is semi-officially dead, I’m wondering where I should put my energy. And I’m wondering if there isn’t a way to improve on the design.
