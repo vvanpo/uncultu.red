@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<title>Integrity of a shared filesystem | February 19, 2026</title>
+<link href="../style.css" rel="stylesheet">
+<meta name="viewport" content="width=device-width">
+
+<style>
+.tree {
+  max-width: 66ch;
+  display: flex;
+
+  pre {
+    margin: 0 auto;
+  }
+}
+
+.grey {
+  color: #999999;
+}
+.green {
+  color: #38761d;
+}
+.purple {
+  color: #9900ff;
+}
+</style>
+
+<h1>Integrity of a shared filesystem</h1>
+
+<p>
+  Picture a contrived end-to-end encrypted networked filesystem: every file is encrypted with the same key, and a group of users (but not the server) possess this key and can read or write file ciphertexts from or to the server. We (the users) trust each other with the confidentiality and integrity of each file, but don’t trust the server not to tamper with ciphertexts, or lie about file existence or modification history. Users might cache some retrieved files, but in general won't have a complete copy of the filesystem on their local devices.
+<p>
+  For individual files, preventing tampering is quite simple: use an authenticated mode of encryption. The server can't forge an arbitrary ciphertext with a valid authentication tag, so we will know when the server responds with something that was not written by one of us. To be certain that the returned file was one written for the requested path, the file path should always be present in the additional authenticated data of the encryption scheme.
+<p>
+  Our first problem is that the server could keep old versions of file ciphertexts, and serve them as though they are the latest. We could agree to write a monotonic sequence number into the file header, which could prevent the server from serving me an older version of the file than the one I have cached. However this provides very weak guarantees: it prevents my view of a cached file from going backwards, but a server could easily trick different users into writing the same sequence number, and serve us different versions. It also isn't of much use if my cache has already evicted the file, unless I maintain an index of the last sequence number for every file I've ever touched. And I still can't be sure if a file handed to me by the server isn't one I previously deleted.
+<p>
+  So if I want to know that a given file retrieval is actually part of the filesystem as it was last written, I need an authentication tag that captures the entire filesystem, without having to pull down every file. The usual way to provide authentication for a set without requiring a copy of every element is to use a Merkle tree. Here the leaves of the tree are hashes of each file ciphertext and branches are hashes of their children.
+
+<h2 id="Merkle-trees">Merkle trees</h2>
+
+<p>
+  We can model how this might work in the simplified case where the filesystem has only one user: I initialize the file system and write the first files to it, compute the Merkle tree of files, save the root hash locally, after which I am free to clear my local file cache.
+
+<div class="tree">
+  <pre>
+                    H(1,7)
+              /               \
+        H(1,4)                 H(5,7)
+      /        \              /      \
+  H(1,2)      H(3,4)      H(5,6)    H(<b class="green">f<sub>7</sub></b>)
+   /   \      /    \      /    \
+H(<b class="green">f<sub>1</sub></b>) H(<b class="green">f<sub>2</sub></b>) H(<b class="green">f<sub>3</sub></b>) H(<b class="green">f<sub>4</sub></b>) H(<b class="green">f<sub>5</sub></b>) H(<b class="green">f<sub>6</sub></b>)            
+  </pre>
+</div>
+
+<p>
+When I go to retrieve a file, say <samp>f<sub>3</sub></samp>, I also request from the server an inclusion proof, which is just the sibling hashes of each node in the path from the leaf up to the root:
+
+<div class="tree grey">
+  <pre>
+                    H(1,7)
+              /               \
+        H(1,4)                 <span class="purple">H(5,7)</span>
+      /        \              /      \
+  <span class="purple">H(1,2)</span>      H(3,4)      H(5,6)    H(f<sub>7</sub>)
+   /   \      /    \      /    \
+H(f<sub>1</sub>) H(f<sub>2</sub>) <strong class="green">H(f<sub>3</sub>)</strong> <span class="purple">H(f<sub>4</sub>)</span> H(f<sub>5</sub>) H(f<sub>6</sub>)            
+  </pre>
+</div>
+
+<p>
+  The server gives me the above sibling hashes in purple, alongside <samp>f<sub>3</sub></samp>. Using <samp>H(f<sub>3</sub>)</samp> and <samp>H(f<sub>4</sub>)</samp> I calculate <samp>H(3,4)</samp>, then <samp>H(1,4)</samp>, and finally the root hash <samp>H(1,7)</samp> which I compare against the one I have saved. If it matches I know that the retrieved <samp>f<sub>3</sub></samp> is the same one I wrote earlier. The server can’t present bogus sibling hashes that calculate to the same root without breaking the hash function—a root that doesn't match would be conclusive evidence of corruption or tampering.
+<p>
+  If I later decide to edit a file, I can request the same inclusion proof, validate it against the existing file as above, and then modify the file and use the sibling hashes from the validated proof to calculate a new Merkle root. If I wanted to add a new file <samp>f<sub>8</sub></samp>, there is enough information in the inclusion proof of <samp>f<sub>7</sub></samp> to calculate the new structure. When deleting a file, the inclusion proof from the to-be-deleted node gives me its sibling which I can collapse into the place of its parent.
+<p>
+  This all relies on the server maintaining the exact same Merkle tree that I build locally, and using the same algorithm for updating it. I want that algorithm to be self-balancing, otherwise my inclusion proofs are no longer <em>log(n)</em>. The server wants it to be a search tree, otherwise it’ll have a hard time looking up a requested inclusion proof or recalculating the tree on modifications. I might further want the tree structure to be canonical, in case I’d like to be able to mirror my files to a second server and have it validate the replication process by independently calculating the same root hash. “Canonical” in this sense means that a given set of files results in an identical tree regardless of the sequence of operations it took to build it. A canonical form has the additional benefit of being able to provide exclusion proofs, where the hashes of the partial path to where a node would be can be used to prove its absence.
+
+<h2 id="Canonical-forms">Canonical forms</h2>
+
+<p>
+  The simplest canonical form I can think of is what is called a sorted “complete” tree, meaning a tree where each level is full except possibly the last, which is filled from left-to-right. In the above example I presented a complete binary tree, but you could choose any <em>k</em>-ary tree. A complete <em>k</em>-ary tree reduces the total number of nodes and the search path, but the inclusion proofs become larger as each sibling along a given path needs to be included. Now, you could come up with an algorithm which retains the completeness property on every insertion and deletion, but these operations would result in <em>O(n)</em> hashes in a Merkle tree. Consider prepending to the sorted list of files—every branch node would need to be recalculated.
+<p>
+  A better canonical form is a prefix tree, also called a trie. If I have files <samp>foo</samp>, <samp>bar</samp>, and <samp>baz</samp>, a trie looks like:
+
+<div class="tree">
+  <pre>
+      <span style="font-size: 1rem">∅</span>
+    <span class="green">f</span>/ <span class="green">b</span>\
+    ◯    ◯
+  <span class="green">o</span>/    <span class="green">a</span>|
+  ◯      ◯
+<span class="green">o</span>/     <span class="green">r</span>/ <span class="green">z</span>\
+◯      ◯    ◯
+  </pre>
+</div>
+
+<p>
+  The edges correspond to the next character in a key, and the leaves (or a branch, if a key is a prefix of another key) contain the value corresponding to the key created by its path. A compressed form of a trie is the oddly-named radix trie, where linear sections are collapsed into a single edge:
+
+<div class="tree">
+  <pre>
+     <span style="font-size: 1rem">∅</span>
+<span class="green">foo</span>/ <span class="green">ba</span>\
+  ◯     ◯
+      <span class="green">r</span>/ <span class="green">z</span>\
+      ◯    ◯
+  </pre>
+</div>
+
+<p>
+  For a given set of keys this form is canonical, and can easily be turned into a Merkle tree. The alphabet size (the “radix”) used to express keys determines the maximum number of children per node, so expressing keys as binary keeps the inclusion proofs small provided the keys are somewhat evenly-distributed. To enforce a uniform distribution, a hash of each file path can be used as keys, which would maintain the average <em>log(n)</em> characteristics of a balanced binary search tree.
+<p>
+  With a binary radix trie as our canonical Merkle tree, the server can calculate an identical root hash as me for every update. When adding a file I can ask the server for its exclusion proof, with which I can calculate the new root. On deletion, I fold the leaf’s sibling into its parent, as radix tries are always “full”, i.e. all branches have the maximum number of children.
+<p>
+  This strategy allows for efficient integrity checks against a networked filesystem with a single user, provided the user never loses their saved copy of the root hash. Now we can address the elephant in the room: on a shared filesystem I am not the only user, and I might have multiple filesystem clients on different devices. Saving the latest Merkle root locally is not sufficient, because eventually someone else will change it. Once my locally-calculated root hash becomes out of date, I can never validate a file again.
+<p>
+  A step forward might be to add a <abbr title="Message authentication code">MAC</abbr> on the locally-calculated Merkle root, and send it to the server with every write. The server distributes this latest root alongside requests for proofs, and the MAC allows users to trust it as a valid root. But here we have the same problem as with individual files: the server could equivocate by sending different roots to different users. A sequence number attached to the root again doesn’t provide much in the way of protection, as the server could withhold a root to lure a user into writing new roots with conflicting sequence numbers.
+
+<h2 id="Merkle-tree-history">Merkle root history</h2>
+
+<p>
+  If each root contains a hash of the previous root, it forms a verifiable chain of authenticated Merkle roots. This doesn’t prevent a server from deceiving users into writing conflicting roots, but unlike with sequence numbers it forces the server to commit to permanently forking the root chain for every user it chooses to deceive. Implied is that the server must maintain the entire history of roots and make it available for verification. Whenever I query the filesystem for the latest root, I must additionally request all intermediate roots since the last one I verified, and walk the chain to validate each hash.
+<p>
+  If the server has forked the root chain between myself and another user, it can’t interleave any updated roots from the other user’s chain without me noticing. This effectively means that a fork for a given user prevents me from seeing their modifications to any file in the system past the fork point ever again, and vice versa. Thus a fork gives the server the ability to withhold, but not to rearrange.
+<p>
+  Committing to perpetually consistent forks might be enough to discourage a server from behaving dishonestly, as users communicating out-of-band are likely to catch on eventually. But there are other mechanisms we could use to detect deception more readily. We could set up independent monitors that keep an updated copy of the latest Merkle root, which our filesystem clients could periodically cross-reference; clients could employ a gossip protocol to establish whether all users have a consistent view of the same root chain; or we could agree on some in-band protocol where everyone periodically writes to a check-in file—if some users conspicuously stop updating the file, we can suspect that the root chain has been forked.
+<p>
+  Given that we can ascertain a consistent Merkle root chain for all users, I can be confident that we’re all seeing an identical untampered filesystem. But in a busy filesystem with thousands of writes per day, verifying the root chain after a period offline is burdensome. If the filesystem sees ~10,000 writes per day and my client is offline for a month, and the system uses a 32 byte hash function and 32 byte MAC where each authenticated root consists of two hash digests and one MAC, I’d have to request 29 MB of the root chain and verify ~300,000 hashes to get up-to-date.
+
+<aside>
+  <p>
+    As an aside, public key transparency logs have the same problem, but operate under a different assumption: their users are not trustworthy. Key transparency logs use a similar construction of Merkle tree roots, but there is no one to authenticate them other than the server. And so users that want to monitor their own key must verify its inclusion proof for every Merkle root in the chain. To make this practical, transparency logs generally batch their writes in evenly-spaced intervals or “epochs”, to keep the number of inclusion proofs a user must request after an offline period small and predictable.
+</aside>
+
+<p>
+  A better solution might be to assemble the Merkle root chain into its own Merkle tree. We can call the Merkle roots of the chain “state roots” (as they represent discrete filesystem states) and the root of the tree-of-roots as the “history root” (as it represents the entire filesystem history) to distinguish them. The history root requires a MAC to authenticate it, implying users are similarly responsible for writing it. This obviates the need for a MAC on each state root, as the history tree can now authenticate it. By ordering state roots temporally, the history tree is structured as an append-only log, meaning we no longer need the previous-root pointer in each state root.
+<p>
+  When retrieving the latest history and state root from the server, I ask for an inclusion proof to authenticate the state root and to prove that it is the last element in the history tree, and another inclusion proof of my last-verified state root to ensure continuity. By having the history tree be append-only we maintain the same fork-consistency guarantees we had with hash-chaining, but can forgo verifying the entire chain in favour of verifying two inclusion proofs.
+<p>
+  We can optimize this slightly by structuring the history tree using the amusingly-named <a href="https://github.com/opentimestamps/opentimestamps-server/blob/master/doc/merkle-mountain-range.md">Merkle Mountain Range</a>. An MMR is a lopsided append-only tree where the inclusion proof sizes are roughly logarithmic in their distance from the tail of the log, meaning that recently-active clients have less work to do to verify the latest root.
+
+<h2 id="Concurrent-writes">Concurrent writes</h2>
+
+<p>
+  The last point we must address is the scalability of such a scheme. The integrity checks are not optional; every client must promise to verify proofs and the history tree prior to publishing a new root, for every write. The MAC on each history root represents a cryptographic chain of custody of the filesystem state—accepting a root without one would give the server free reign to reset the state to whatever it desires. Inclusion proofs for a file in the state tree grow in size with the number of files in the filesystem, and proofs for the latest state root grow with the number of filesystem updates since last verification. In both cases these are logarithmic, so verifying the latest root after a million modifications will require ~20 hashes, and verifying the integrity of a file in a filesystem with a billion entries will take ~30. Modern hash functions are fast enough that this is unlikely to overshadow the computation of encrypting and transferring the corresponding file.
+<p>
+  Serializing the history of filesystem state implies the serialization of writes. When I go to modify a file, my filesystem client must precede it with a retrieval and verification of the latest root, and further verify that my copy of the file is still up-to-date, otherwise I could overwrite someone else’s edit. After modifying the file locally, I hash it and calculate the new state and history roots, using the inclusion proofs I just verified. Finally I send the file, new state root, and new history root to the server. The server needs to validate that the state root I sent results in a matching history root once appended to the tree. If not, it indicates a race condition where another user has written to the filesystem in the time between retrieving the latest root and writing a new one. The server should reject the write in such cases—not doing so would imply forking my history.
+<p>
+  This read-update-write protocol is essentially an implementation of optimistic locking, which is a perfectly reasonable concurrency model for updating individual files in a shared filesystem. However, history serialization turns this into a global lock, preventing concurrent writes even of different files. This isn’t desirable for most filesystems; users generally don’t need total ordering of modification history across all files in a filesystem.
+<p>
+  We can relax the ordering requirement somewhat by not committing to a specific root position in the history at the time of file modification, with the help of the server. I could send my file update to the server prior to calculating the new root, but take note of the hashes of both my update and the prior version. The server could then buffer the new file version, and respond with the latest root and inclusion proof for the existing file. This lets my client validate that (a) the file hasn’t changed out from under me, and (b) calculate the new roots, which it immediately sends to the server. In case of a race condition, the server can just respond again with the latest roots and proof, giving my client a chance to try again. Once the operation succeeds with an uncontended root, the server can commit the buffered update.
+<p>
+  This back-and-forth between client and server reduces the latency between retrieving and calculating a new root, improving the chance of a successful write. Slow clients might get stuck recalculating for some time waiting for contention to let up, but use minimal bandwidth as they only need to upload the file once.
